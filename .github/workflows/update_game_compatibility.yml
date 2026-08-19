@@ -17,7 +17,7 @@ jobs:
 
       - name: Generate Compatibility Data
         run: |
-          BASE_URL="https://api.github.com/repos/shadps5-compatibility/shadps5-game-compatibility/issues"
+          BASE_URL="https://api.github.com/repos/shadps5-emu/shadps5-game-compatibility/issues"
           PER_PAGE=100
           PAGE=1
           COMPATIBILITY_DATABASE=$(jq -n '{}')
