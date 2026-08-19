@@ -1,0 +1,204 @@
+name: Update Compatibility Data
+
+on:
+  push:
+    branches: [ main ] # Every time there is a push on main
+  schedule:
+    - cron: '0 */3 * * *'  # Every 3 hours
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Compatibility Data
+        run: |
+          BASE_URL="https://api.github.com/repos/shadps5-compatibility/shadps5-game-compatibility/issues"
+          PER_PAGE=100
+          PAGE=1
+          COMPATIBILITY_DATABASE=$(jq -n '{}')
+
+          # Pull a single-line value out of an issue-form body.
+          #   $1 = issue body, $2 = form label (e.g. "Game Name")
+          field() {
+            printf '%s\n' "$1" | tr -d '\r' | awk -v label="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" '
+              { l = tolower($0) }
+              l ~ "^###[ \t]*" label "[ \t]*$" { f = 1; next }
+              /^###/ { f = 0 }
+              f && NF { gsub(/^[ \t]+|[ \t]+$/, ""); print; exit }
+            '
+          }
+
+          fetch_issues() {
+            echo "Fetching page $PAGE..."
+            curl -s -H "Authorization: token ${{ secrets.SHADPS5_TOKEN_COMPATIBILITY }}" -D headers.txt -o body.json "${BASE_URL}?per_page=${PER_PAGE}&page=${PAGE}"
+
+            # Validate JSON
+            if ! jq empty body.json > /dev/null 2>&1; then
+              echo "Error: Invalid JSON response"
+              cat body.json
+              return 1
+            fi
+
+            # Check for GitHub API error message
+            if jq -e 'type == "object" and has("message")' body.json > /dev/null; then
+              echo "GitHub API error: $(jq -r '.message' body.json)"
+              return 1
+            fi
+
+            ITEM_COUNT=$(jq 'length' body.json)
+            if [ "$ITEM_COUNT" -eq 0 ]; then
+              echo "No items returned, stopping."
+              return 1
+            fi
+
+            for issue in $(jq -r '.[] | @base64' body.json); do
+              _jq() {
+                echo "$issue" | base64 --decode | jq -r "$1"
+              }
+
+              TITLE=$(_jq '.title')
+              ISSUE_BODY=$(_jq '.body // ""')
+              ISSUE_NUMBER=$(_jq '.number')
+              UPDATED_AT=$(_jq '.updated_at')
+              MILESTONE=$(_jq '.milestone')
+
+              if [ "$MILESTONE" == "null" ]; then
+                VERSION="unknown"
+              else
+                VERSION=$(echo "$MILESTONE" | jq -r '.title // "unknown"')
+              fi
+
+              LABELS=$(_jq '.labels | map(.name) | .[]')
+              LABELS_JSON=$(_jq '.labels | map(.name)')
+
+              # --- serial: prefer the form field, fall back to the title -------
+              SERIAL=$(field "$ISSUE_BODY" "Game serial" | grep -ioE '[A-Z]{4}[0-9]{5}' | head -n1 | tr '[:lower:]' '[:upper:]')
+              if [ -z "$SERIAL" ]; then
+                SERIAL=$(printf '%s' "$TITLE" | grep -ioE 'CUSA[0-9]{5}' | head -n1 | tr '[:lower:]' '[:upper:]')
+              fi
+
+              # --- name: prefer the form field, fall back to the title ---------
+              NAME=$(field "$ISSUE_BODY" "Game Name")
+              if [ -z "$NAME" ]; then
+                NAME=$(printf '%s' "$TITLE" | sed -E 's/^[[:space:]]*[A-Z]{4}[0-9]{5}[[:space:]]*[-–—:]?[[:space:]]*//I')
+              fi
+
+              if [ -n "$SERIAL" ]; then
+                CUSA_ID="$SERIAL"
+                OS_TYPE="os-unknown"
+                STATUS="status-unknown"
+
+                for label in $LABELS; do
+                  [[ "$label" == os-* ]] && OS_TYPE="$label"
+                  [[ "$label" == status-* ]] && STATUS="$label"
+                done
+
+                COMPATIBILITY_OBJ=$(jq -n \
+                  --arg issue_number "$ISSUE_NUMBER" \
+                  --arg name "$NAME" \
+                  --arg serial "$SERIAL" \
+                  --arg last_tested "$UPDATED_AT" \
+                  --arg status "$STATUS" \
+                  --arg version "$VERSION" \
+                  --argjson labels "$LABELS_JSON" \
+                  '{
+                    issue_number: $issue_number,
+                    name: $name,
+                    serial: $serial,
+                    last_tested: $last_tested,
+                    status: $status,
+                    version: $version,
+                    labels: $labels
+                  }')
+
+                COMPATIBILITY_DATABASE=$(echo "$COMPATIBILITY_DATABASE" | jq \
+                  --arg CUSA_ID "$CUSA_ID" \
+                  --arg OS_TYPE "$OS_TYPE" \
+                  --argjson COMPATIBILITY_OBJ "$COMPATIBILITY_OBJ" \
+                  'if .[$CUSA_ID] then .[$CUSA_ID] += {($OS_TYPE): $COMPATIBILITY_OBJ} else . + {($CUSA_ID): {($OS_TYPE): $COMPATIBILITY_OBJ}} end')
+              fi
+            done
+
+            # Check if there is a next page
+            if ! grep -qi 'rel="next"' headers.txt; then
+              echo "No more pages."
+              return 1
+            fi
+
+            return 0
+          }
+
+          while :; do
+            fetch_issues || break
+            PAGE=$((PAGE + 1))
+            sleep 1
+          done
+
+          echo "$COMPATIBILITY_DATABASE" > compatibility_data.json
+
+      - name: Verify Compatibility Data file size
+        id: verify
+        run: |
+          FILE_SIZE=$(stat -c %s compatibility_data.json)
+          MAX_FILE_SIZE=102400  # 100 KB
+
+          if [ "$FILE_SIZE" -lt "$MAX_FILE_SIZE" ]; then
+            echo "Compatibility data file is too small ($FILE_SIZE bytes), skipping release creation."
+            echo "create_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Compatibility data file is valid ($FILE_SIZE bytes). Proceeding."
+            echo "create_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete all releases and tags
+        if: steps.verify.outputs.create_release == 'true'
+        run: |
+          TOKEN="${{ secrets.SHADPS5_TOKEN_COMPATIBILITY }}"
+          REPO="${{ github.repository }}"
+
+          RELEASES=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/repos/$REPO/releases)
+          for release_id in $(echo "$RELEASES" | jq -r '.[].id'); do
+            echo "Deleting release ID $release_id"
+            curl -s -X DELETE -H "Authorization: token $TOKEN" "https://api.github.com/repos/$REPO/releases/$release_id"
+          done
+
+          TAGS=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/repos/$REPO/tags)
+          for tag in $(echo "$TAGS" | jq -r '.[].name'); do
+            echo "Deleting tag $tag"
+            curl -s -X DELETE -H "Authorization: token $TOKEN" "https://api.github.com/repos/$REPO/git/refs/tags/$tag"
+          done
+
+      - name: Create a GitHub Release and Upload Data
+        if: steps.verify.outputs.create_release == 'true'
+        run: |
+          TAG_NAME="v$(date +'%Y%m%d%H%M%S')"
+          RELEASE_NAME="shadps5-game-compatibility"  # Fixed name for the release
+          BODY="Compatibility data update"
+
+          RESPONSE=$(curl -s \
+            -H "Authorization: token ${{ secrets.SHADPS5_TOKEN_COMPATIBILITY }}" \
+            -X POST \
+            -d '{
+                  "tag_name": "'"$TAG_NAME"'",
+                  "target_commitish": "main", 
+                  "name": "'"$RELEASE_NAME"'",
+                  "body": "'"$BODY"'",
+                  "draft": false,
+                  "prerelease": false
+                }' \
+            https://api.github.com/repos/${{ github.repository }}/releases)
+
+          # Extract the ID of the created release
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r .id)
+
+          # Upload the data file to the release
+          curl -s \
+            -H "Authorization: token ${{ secrets.SHADPS5_TOKEN_COMPATIBILITY }}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @compatibility_data.json \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=compatibility_data.json"
