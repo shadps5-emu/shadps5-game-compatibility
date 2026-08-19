@@ -79,7 +79,7 @@ jobs:
               # --- serial: prefer the form field, fall back to the title -------
               SERIAL=$(field "$ISSUE_BODY" "Game serial" | grep -ioE '[A-Z]{4}[0-9]{5}' | head -n1 | tr '[:lower:]' '[:upper:]')
               if [ -z "$SERIAL" ]; then
-                SERIAL=$(printf '%s' "$TITLE" | grep -ioE 'CUSA[0-9]{5}' | head -n1 | tr '[:lower:]' '[:upper:]')
+                SERIAL=$(printf '%s' "$TITLE" | grep -ioE '(PPSA|CUSA)[0-9]{5}' | head -n1 | tr '[:lower:]' '[:upper:]')
               fi
 
               # --- name: prefer the form field, fall back to the title ---------
